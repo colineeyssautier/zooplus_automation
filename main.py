@@ -9,7 +9,9 @@ Variables d'environnement :
   RELAY_TOKEN      jeton secret partagé avec l'outil du navigateur (obligatoire)
   ALLOWED_ORIGINS  origines autorisées, séparées par des virgules
                    (défaut : https://article-admin.private.zooplus.net)
-  GROQ_MODEL       modèle par défaut (défaut : llama-3.3-70b-versatile)
+  GROQ_MODEL       modèle par défaut (défaut : openai/gpt-oss-120b)
+  GROQ_REASONING_EFFORT  facultatif : réglage de la réflexion du modèle (ex. low),
+                   utilisé quand la requête n'en précise pas
 """
 from __future__ import annotations
 
@@ -50,7 +52,8 @@ class ChatIn(BaseModel):
     messages: list[Msg] = Field(min_length=1, max_length=10)
     model: str | None = Field(default=None, max_length=80)
     temperature: float = Field(default=0.4, ge=0, le=1.5)
-    max_tokens: int = Field(default=2000, ge=1, le=4000)
+    max_tokens: int = Field(default=3000, ge=1, le=8000)
+    reasoning_effort: str | None = Field(default=None, max_length=20)
 
 
 def check_token(token: str | None) -> None:
@@ -99,14 +102,31 @@ async def models(x_relay_token: str | None = Header(default=None)):
 async def chat(body: ChatIn, x_relay_token: str | None = Header(default=None)):
     check_token(x_relay_token)
     payload = {
-        "model": body.model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "model": body.model or os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
         "messages": [m.model_dump() for m in body.messages],
         "temperature": body.temperature,
         "max_tokens": body.max_tokens,
     }
+    effort = body.reasoning_effort or os.environ.get("GROQ_REASONING_EFFORT")
+    if effort:
+        payload["reasoning_effort"] = effort
     data = await call_groq(payload)
     try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
+        choice = data["choices"][0]
+        content = choice["message"].get("content") or ""
+        finish = choice.get("finish_reason")
+    except (KeyError, IndexError, AttributeError):
         raise HTTPException(502, "réponse Groq inattendue")
-    return {"content": content, "model": data.get("model", payload["model"]), "usage": data.get("usage")}
+    if not content.strip():
+        raise HTTPException(
+            502,
+            "réponse vide (finish_reason=%s) : le modèle a probablement utilisé tous ses "
+            "tokens pour réfléchir. Augmenter max_tokens ou baisser reasoning_effort." % finish,
+        )
+    return {
+        "content": content,
+        "model": data.get("model", payload["model"]),
+        "finish_reason": finish,
+        "truncated": finish == "length",
+        "usage": data.get("usage"),
+    }
